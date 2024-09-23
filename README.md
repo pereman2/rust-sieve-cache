@@ -1,6 +1,8 @@
 [![dependency status](https://deps.rs/repo/github/jedisct1/rust-sieve-cache/status.svg)](https://deps.rs/repo/github/jedisct1/rust-sieve-cache)
 
-# SIEVE cache
+# SIEVE cache (Pere's style)
+
+**this fork adds some eviction stuff that is highly experimental (eviction policies) and not studied!!!** 
 
 This is an implementation of the [SIEVE](http://sievecache.com) cache replacement algorithm for Rust.
 
