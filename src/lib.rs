@@ -24,6 +24,8 @@ impl<K: Eq + Hash + Clone, V> Node<K, V> {
     }
 }
 
+type EvictDictator<K: Eq + Hash + Clone, V> = fn(&K, &V) -> bool;
+
 /// A cache based on the SIEVE eviction algorithm.
 pub struct SieveCache<K: Eq + Hash + Clone, V> {
     map: HashMap<K, Box<Node<K, V>>>,
@@ -32,6 +34,7 @@ pub struct SieveCache<K: Eq + Hash + Clone, V> {
     hand: Option<NonNull<Node<K, V>>>,
     capacity: usize,
     len: usize,
+    evict_condition: Option<EvictDictator<K, V>>,
 }
 
 unsafe impl<K: Eq + Hash + Clone, V> Send for SieveCache<K, V> {}
@@ -49,6 +52,25 @@ impl<K: Eq + Hash + Clone, V> SieveCache<K, V> {
             hand: None,
             capacity,
             len: 0,
+            evict_condition: None,
+        })
+    }
+
+    pub fn with_evict_condition(
+        capacity: usize,
+        evict_dictator: EvictDictator<K, V>,
+    ) -> Result<Self, &'static str> {
+        if capacity == 0 {
+            return Err("capacity must be greater than 0");
+        }
+        Ok(Self {
+            map: HashMap::with_capacity(capacity),
+            head: None,
+            tail: None,
+            hand: None,
+            capacity,
+            len: 0,
+            evict_condition: Some(evict_dictator),
         })
     }
 
@@ -108,17 +130,19 @@ impl<K: Eq + Hash + Clone, V> SieveCache<K, V> {
 
     /// Map `key` to `value` in the cache, possibly evicting old entries.
     ///
-    /// This method returns `true` when this is a new entry, and `false` if an existing entry was
-    /// updated.
-    pub fn insert(&mut self, key: K, value: V) -> bool {
+    /// This method returns `(true, true)` when this is a new entry, and `(false, true)` if an existing entry was
+    /// updated. Last value of the pair is false if it failed to evict an entry to insert a new one.
+    pub fn insert(&mut self, key: K, value: V) -> (bool, bool) {
         let node = self.map.get_mut(&key);
         if let Some(node_) = node {
             node_.visited = true;
             node_.value = value;
-            return false;
+            return (false, true);
         }
         if self.len >= self.capacity {
-            self.evict();
+            if !self.evict() {
+                return (false, false);
+            }
         }
         let node = Box::new(Node::new(key.clone(), value));
         self.add_node(NonNull::from(node.as_ref()));
@@ -126,7 +150,7 @@ impl<K: Eq + Hash + Clone, V> SieveCache<K, V> {
         self.map.insert(key, node);
         debug_assert!(self.len < self.capacity);
         self.len += 1;
-        true
+        (true, true)
     }
 
     /// Remove the cache entry mapped to by `key`.
@@ -179,12 +203,26 @@ impl<K: Eq + Hash + Clone, V> SieveCache<K, V> {
         }
     }
 
-    fn evict(&mut self) {
+    fn evict(&mut self) -> bool {
         let mut node = self.hand.or(self.tail);
+        let len = self.len();
+        let mut visited = 0;
         while node.is_some() {
+            if visited >= len {
+                // We cannot evict anything
+                return false;
+            }
             let mut node_ = node.unwrap();
+            visited += 1;
             unsafe {
-                if !node_.as_ref().visited {
+                let node_ref = node_.as_ref();
+                if !node_ref.visited && self.evict_condition.is_none() {
+                    break;
+                }
+                if !node_ref.visited
+                    && self.evict_condition.is_some()
+                        & self.evict_condition.unwrap()(&node_ref.key, &node_ref.value)
+                {
                     break;
                 }
                 node_.as_mut().visited = false;
@@ -204,17 +242,26 @@ impl<K: Eq + Hash + Clone, V> SieveCache<K, V> {
             debug_assert!(self.len > 0);
             self.len -= 1;
         }
+        true
     }
 }
 
 #[test]
 fn test() {
     let mut cache = SieveCache::new(3).unwrap();
-    assert!(cache.insert("foo".to_string(), "foocontent".to_string()));
-    assert!(cache.insert("bar".to_string(), "barcontent".to_string()));
+    assert!(cache.insert("foo".to_string(), "foocontent".to_string()).0);
+    assert!(cache.insert("bar".to_string(), "barcontent".to_string()).0);
     cache.remove("bar");
-    assert!(cache.insert("bar2".to_string(), "bar2content".to_string()));
-    assert!(cache.insert("bar3".to_string(), "bar3content".to_string()));
+    assert!(
+        cache
+            .insert("bar2".to_string(), "bar2content".to_string())
+            .0
+    );
+    assert!(
+        cache
+            .insert("bar3".to_string(), "bar3content".to_string())
+            .0
+    );
     assert_eq!(cache.get("foo"), Some(&"foocontent".to_string()));
     assert_eq!(cache.get("bar"), None);
     assert_eq!(cache.get("bar2"), Some(&"bar2content".to_string()));
@@ -231,4 +278,35 @@ fn test_visited_flag_update() {
     // new entry is added.
     cache.insert("key3".to_string(), "value3".to_string());
     assert_eq!(cache.get("key1"), Some(&"updated".to_string()));
+}
+
+fn evict_string_cond(k: &String, v: &String) -> bool {
+    dbg!(v);
+    return v.len() < 6;
+}
+
+#[test]
+fn test_with_eviction() {
+    let mut cache = SieveCache::with_evict_condition(3, evict_string_cond).unwrap();
+    assert!(cache.insert("a".to_string(), "aaaaaa".to_string()).0);
+    assert!(cache.insert("b".to_string(), "bbbbbb".to_string()).0);
+    assert!(cache.insert("c".to_string(), "cccccc".to_string()).0);
+    assert!(cache.insert("bar".to_string(), "barc".to_string()).1 == false);
+    assert_eq!(cache.get("a"), Some(&"aaaaaa".to_string()));
+    assert_eq!(cache.get("b"), Some(&"bbbbbb".to_string()));
+    assert_eq!(cache.get("c"), Some(&"cccccc".to_string()));
+    assert_eq!(cache.get("bar"), None);
+}
+
+#[test]
+fn test_with_eviction_2() {
+    let mut cache = SieveCache::with_evict_condition(3, evict_string_cond).unwrap();
+    assert!(cache.insert("a".to_string(), "aaaaaa".to_string()).0);
+    assert!(cache.insert("b".to_string(), "bbbbbb".to_string()).0);
+    assert!(cache.insert("c".to_string(), "c".to_string()).0);
+    assert!(cache.insert("bar".to_string(), "barc".to_string()).1 == true);
+    assert_eq!(cache.get("a"), Some(&"aaaaaa".to_string()));
+    assert_eq!(cache.get("b"), Some(&"bbbbbb".to_string()));
+    assert_eq!(cache.get("bar"), Some(&"barc".to_string()));
+    assert_eq!(cache.get("c"), None);
 }
